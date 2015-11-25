@@ -30,17 +30,17 @@ import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
 import spark.Access;
+import spark.ExceptionHandlerImpl;
+import spark.ExceptionMapper;
 import spark.FilterImpl;
 import spark.HaltException;
 import spark.Request;
 import spark.RequestResponseFactory;
 import spark.Response;
 import spark.RouteImpl;
-import spark.ExceptionHandlerImpl;
-import spark.ExceptionMapper;
 import spark.route.HttpMethod;
-import spark.routematch.RouteMatch;
 import spark.route.SimpleRouteMatcher;
+import spark.routematch.RouteMatch;
 import spark.utils.GzipUtils;
 import spark.webserver.serialization.SerializerChain;
 
@@ -139,6 +139,7 @@ public class MatcherFilter implements Filter {
             if (match != null) {
                 target = match.getTarget();
             } else if (httpMethod == HttpMethod.head && bodyContent == null) {
+                responseWrapper.state = ResponseWrapper.State.PROCESSED;
                 // See if get is mapped to provide default head mapping
                 bodyContent =
                         routeMatcher.findTargetForRequestedRoute(HttpMethod.get, uri, acceptType) != null ? "" : null;
@@ -146,6 +147,7 @@ public class MatcherFilter implements Filter {
 
             if (target != null) {
                 try {
+                    responseWrapper.state = ResponseWrapper.State.PROCESSED;
                     Object result = null;
                     if (target instanceof RouteImpl) {
                         RouteImpl route = ((RouteImpl) target);
@@ -201,46 +203,39 @@ public class MatcherFilter implements Filter {
 
         } catch (HaltException hEx) {
             LOG.debug("halt performed");
+            responseWrapper.state = ResponseWrapper.State.HALT;
             httpResponse.setStatus(hEx.getStatusCode());
             if (hEx.getBody() != null) {
                 bodyContent = hEx.getBody();
-            } else {
-                bodyContent = "";
             }
         } catch (Exception e) {
             ExceptionHandlerImpl handler = ExceptionMapper.getInstance().getHandler(e);
             if (handler != null) {
                 handler.handle(e, requestWrapper, responseWrapper);
+                responseWrapper.state = ResponseWrapper.State.EXCEPTION_HANDLED;
                 String bodyAfterFilter = Access.getBody(responseWrapper.getDelegate());
                 if (bodyAfterFilter != null) {
                     bodyContent = bodyAfterFilter;
                 }
             } else {
-                LOG.error("", e);
+                LOG.error("Unhandled error:", e);
                 httpResponse.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
                 bodyContent = INTERNAL_ERROR;
             }
         }
 
-        // If redirected and content is null set to empty string to not throw NotConsumedException
-        if (bodyContent == null && responseWrapper.isRedirected()) {
-            bodyContent = "";
-        }
-
-        boolean consumed = bodyContent != null;
-
-        if (!consumed && hasOtherHandlers) {
+        if (responseWrapper.state.notConsumed() && hasOtherHandlers) {
             throw new NotConsumedException();
         }
 
-        if (!consumed && !isServletContext) {
-            LOG.info("The requested route [" + uri + "] has not been mapped in Spark");
+        if (responseWrapper.state.notConsumed() && !isServletContext) {
+            LOG.info("The requested route {} [{}] has not been mapped in Spark",
+                     httpMethodStr.toUpperCase(), uri);
             httpResponse.setStatus(HttpServletResponse.SC_NOT_FOUND);
-            bodyContent = String.format(NOT_FOUND);
-            consumed = true;
+            bodyContent = NOT_FOUND;
         }
 
-        if (consumed) {
+        if (responseWrapper.state.consumed() && bodyContent != null) {
             // Write body content
             if (!httpResponse.isCommitted()) {
                 if (httpResponse.getContentType() == null) {
